@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Isometric FPS - TI-84 Style</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #1a1a2e;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+        }
+        
+        .container {
+            text-align: center;
+        }
+        
+        h1 {
+            color: #00ff88;
+            margin-bottom: 10px;
+            font-size: 24px;
+            text-shadow: 0 0 10px #00ff88;
+        }
+        
+        .info {
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 15px;
+        }
+        
+        canvas {
+            border: 3px solid #00ff88;
+            border-radius: 5px;
+            box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+            image-rendering: pixelated;
+        }
+        
+        .controls {
+            color: #aaa;
+            font-size: 11px;
+            margin-top: 15px;
+            line-height: 1.6;
+        }
+        
+        .stats {
+            color: #00ff88;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎮 ISOMETRIC FPS</h1>
+        <p class="info">TI-84 Plus CE Inspired Rendering Engine</p>
+        <canvas id="gameCanvas" width="640" height="480"></canvas>
+        <div class="controls">
+            WASD/Arrows: Move | Mouse: Aim | Click: Shoot | Space: Jump<br>
+            Isometric Projection (2:1 ratio) | Triangle Grid Depth Map | Indexed Palette Shading
+        </div>
+        <div class="stats" id="stats">FPS: 0 | Blocks: 0 | Visible: 0</div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const statsEl = document.getElementById('stats');
+        
+        // Game constants - Isometric projection ratio (2:1)
+        const ISO_RATIO = 0.5; // 2:1 isometric ratio
+        const TILE_SIZE = 32;
+        const MAP_SIZE = 16;
+        const PLAYER_HEIGHT = 20;
+        const GRAVITY = 0.5;
+        const JUMP_FORCE = -8;
+        const MOVE_SPEED = 3;
+        
+        // Indexed palette for fast shading (simulating 256-color palette)
+        const PALETTE = {
+            floor: ['#2d4a2d', '#3d5a3d', '#4d6a4d', '#5d7a5d'],
+            wall: ['#8b4513', '#a0522d', '#b5693d', '#ca7d4d'],
+            water: ['rgba(100, 149, 237, 0.6)', 'rgba(100, 149, 237, 0.7)', 'rgba(100, 149, 237, 0.8)', 'rgba(100, 149, 237, 0.9)'],
+            shadow: ['#1a1a1a', '#2a2a2a', '#3a3a3a', '#4a4a4a'],
+            enemy: ['#ff4444', '#ff6666', '#ff8888', '#ffaaaa'],
+            bullet: ['#ffff00', '#ffff44', '#ffff88', '#ffffff']
+        };
+        
+        // Game state
+        let player = {
+            x: MAP_SIZE * TILE_SIZE / 2,
+            y: MAP_SIZE * TILE_SIZE / 2,
+            z: 0,
+            vz: 0,
+            angle: 0,
+            health: 100,
+            ammo: 50
+        };
+        
+        let camera = {
+            x: 0,
+            y: 0,
+            z: 0
+        };
+        
+        let bullets = [];
+        let enemies = [];
+        let particles = [];
+        let lastFrame = null;
+        let frameCount = 0;
+        let fps = 0;
+        
+        // Triangle grid map for depth sorting
+        // Each block is split into 6 triangular slices for precise depth testing
+        let map = [];
+        let depthMap = [];
+        
+        // Initialize map with blocks
+        function initMap() {
+            map = [];
+            depthMap = [];
+            
+            for (let x = 0; x < MAP_SIZE; x++) {
+                map[x] = [];
+                depthMap[x] = [];
+                for (let y = 0; y < MAP_SIZE; y++) {
+                    // Create interesting map layout
+                    let height = 0;
+                    if (x === 0 || x === MAP_SIZE - 1 || y === 0 || y === MAP_SIZE - 1) {
+                        height = 2; // Border walls
+                    } else if ((x + y) % 5 === 0 && Math.random() > 0.3) {
+                        height = Math.floor(Math.random() * 2) + 1;
+                    } else if (Math.random() < 0.1) {
+                        height = 1;
+                    }
+                    
+                    map[x][y] = {
+                        height: height,
+                        type: height > 0 ? 'wall' : 'floor',
+                        water: Math.random() < 0.05 && height === 0
+                    };
+                    
+                    // Initialize depth map with 6 triangular slices per block
+                    depthMap[x][y] = [];
+                    for (let i = 0; i < 6; i++) {
+                        depthMap[x][y][i] = {
+                            visible: true,
+                            depth: Infinity
+                        };
+                    }
+                }
+            }
+            
+            // Spawn enemies
+            for (let i = 0; i < 5; i++) {
+                spawnEnemy();
+            }
+        }
+        
+        function spawnEnemy() {
+            let x, y;
+            do {
+                x = Math.floor(Math.random() * MAP_SIZE);
+                y = Math.floor(Math.random() * MAP_SIZE);
+            } while (map[x][y].height > 0 || 
+                     Math.abs(x * TILE_SIZE - player.x) < 100 && 
+                     Math.abs(y * TILE_SIZE - player.y) < 100);
+            
+            enemies.push({
+                x: x * TILE_SIZE + TILE_SIZE / 2,
+                y: y * TILE_SIZE + TILE_SIZE / 2,
+                z: 0,
+                health: 3,
+                lastShot: 0
+            });
+        }
+        
+        // Convert world coordinates to isometric screen coordinates
+        function worldToIso(x, y, z) {
+            const isoX = (x - y) * ISO_RATIO;
+            const isoY = (x + y) * ISO_RATIO * 0.5 - z;
+            return {
+                x: isoX + canvas.width / 2 - camera.x,
+                y: isoY + canvas.height / 3 - camera.y
+            };
+        }
+        
+        // Convert screen coordinates to world coordinates
+        function isoToWorld(screenX, screenY) {
+            const adjX = screenX - canvas.width / 2 + camera.x;
+            const adjY = screenY - canvas.height / 3 + camera.y;
+            
+            const worldY = (adjY / ISO_RATIO * 0.5 - adjX) / (ISO_RATIO * ISO_RATIO * 0.5 + 1);
+            const worldX = (adjX + worldY) / ISO_RATIO;
+            
+            return { x: worldX, y: worldY };
+        }
+        
+        // Update depth map using triangle grid algorithm
+        // Splits each block into 6 triangles for precise depth testing
+        function updateDepthMap() {
+            const playerBlockX = Math.floor(player.x / TILE_SIZE);
+            const playerBlockY = Math.floor(player.y / TILE_SIZE);
+            
+            for (let x = 0; x < MAP_SIZE; x++) {
+                for (let y = 0; y < MAP_SIZE; y++) {
+                    const block = map[x][y];
+                    const dist = Math.sqrt(
+                        Math.pow(x - playerBlockX, 2) + 
+                        Math.pow(y - playerBlockY, 2)
+                    );
+                    
+                    // Calculate depth for each of the 6 triangular slices
+                    for (let i = 0; i < 6; i++) {
+                        const slice = depthMap[x][y][i];
+                        
+                        // Distance-based depth with angular component for triangle slicing
+                        const angleOffset = (i / 6) * Math.PI * 2;
+                        slice.depth = dist + Math.sin(player.angle - angleOffset) * 0.5;
+                        
+                        // Mark as visible if not occluded
+                        slice.visible = block.height > 0 || block.water;
+                    }
+                }
+            }
+        }
+        
+        // Fast memory copy simulation for scrolling
+        // Instead of redrawing everything, we shift the existing frame
+        let previousFrame = null;
+        
+        function copyPreviousFrame(deltaX, deltaY) {
+            if (previousFrame && Math.abs(deltaX) < 10 && Math.abs(deltaY) < 10) {
+                // Copy previous frame with offset (simulating hardware memory copy)
+                try {
+                    ctx.putImageData(previousFrame, deltaX, deltaY);
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+            return false;
+        }
+        
+        // Render using indexed palette shading for transparency and shadows
+        function render() {
+            // Clear canvas
+            ctx.fillStyle = '#1a1a2e';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Collect all renderable objects with depth
+            const renderList = [];
+            
+            // Add map blocks
+            for (let x = 0; x < MAP_SIZE; x++) {
+                for (let y = 0; y < MAP_SIZE; y++) {
+                    const block = map[x][y];
+                    const worldX = x * TILE_SIZE;
+                    const worldY = y * TILE_SIZE;
+                    
+                    // Check if in view frustum
+                    const iso = worldToIso(worldX, worldY, 0);
+                    if (iso.x < -TILE_SIZE * 2 || iso.x > canvas.width + TILE_SIZE * 2 ||
+                        iso.y < -TILE_SIZE * 2 || iso.y > canvas.height + TILE_SIZE * 2) {
+                        continue;
+                    }
+                    
+                    // Floor
+                    if (block.height === 0) {
+                        const depth = Math.sqrt(Math.pow(x - player.x / TILE_SIZE, 2) + 
+                                              Math.pow(y - player.y / TILE_SIZE, 2));
+                        
+                        if (block.water) {
+                            // Water with transparency using indexed palette
+                            const shadeIndex = Math.min(3, Math.floor(depth / 5));
+                            renderList.push({
+                                type: 'water',
+                                x: worldX,
+                                y: worldY,
+                                z: 0,
+                                depth: depth,
+                                shade: shadeIndex
+                            });
+                        } else {
+                            // Floor with shadow shading
+                            const shadeIndex = Math.min(3, Math.floor(depth / 8));
+                            renderList.push({
+                                type: 'floor',
+                                x: worldX,
+                                y: worldY,
+                                z: 0,
+                                depth: depth,
+                                shade: shadeIndex
+                            });
+                        }
+                    }
+                    
+                    // Walls (render as stacked blocks)
+                    for (let h = 0; h < block.height; h++) {
+                        const depth = Math.sqrt(Math.pow(x - player.x / TILE_SIZE, 2) + 
+                                              Math.pow(y - player.y / TILE_SIZE, 2));
+                        const shadeIndex = Math.min(3, Math.floor(depth / 8));
+                        
+                        renderList.push({
+                            type: 'wall',
+                            x: worldX,
+                            y: worldY,
+                            z: h * 16,
+                            depth: depth,
+                            shade: shadeIndex,
+                            height: h
+                        });
+                    }
+                }
+            }
+            
+            // Add enemies
+            enemies.forEach((enemy, index) => {
+                const depth = Math.sqrt(
+                    Math.pow(enemy.x - player.x, 2) + 
+                    Math.pow(enemy.y - player.y, 2)
+                ) / TILE_SIZE;
+                
+                renderList.push({
+                    type: 'enemy',
+                    x: enemy.x,
+                    y: enemy.y,
+                    z: enemy.z,
+                    depth: depth,
+                    enemy: enemy,
+                    index: index
+                });
+            });
+            
+            // Add player weapon
+            const playerDepth = 0;
+            renderList.push({
+                type: 'weapon',
+                x: player.x,
+                y: player.y,
+                z: player.z + 10,
+                depth: playerDepth
+            });
+            
+            // Add bullets
+            bullets.forEach((bullet, index) => {
+                const depth = Math.sqrt(
+                    Math.pow(bullet.x - player.x, 2) + 
+                    Math.pow(bullet.y - player.y, 2)
+                ) / TILE_SIZE;
+                
+                renderList.push({
+                    type: 'bullet',
+                    x: bullet.x,
+                    y: bullet.y,
+                    z: bullet.z,
+                    depth: depth,
+                    index: index
+                });
+            });
+            
+            // Sort by depth (far to near)
+            renderList.sort((a, b) => b.depth - a.depth);
+            
+            // Render all objects
+            let visibleCount = 0;
+            renderList.forEach(obj => {
+                const iso = worldToIso(obj.x, obj.y, obj.z);
+                
+                if (obj.type === 'floor') {
+                    drawFloor(iso.x, iso.y, obj.shade);
+                    visibleCount++;
+                } else if (obj.type === 'water') {
+                    drawWater(iso.x, iso.y, obj.shade);
+                    visibleCount++;
+                } else if (obj.type === 'wall') {
+                    drawWall(iso.x, iso.y, obj.shade, obj.height);
+                    visibleCount++;
+                } else if (obj.type === 'enemy') {
+                    drawEnemy(iso.x, iso.y, obj.enemy);
+                    visibleCount++;
+                } else if (obj.type === 'weapon') {
+                    drawWeapon(iso.x, iso.y);
+                } else if (obj.type === 'bullet') {
+                    drawBullet(iso.x, iso.y, bullets[obj.index]);
+                    visibleCount++;
+                }
+            });
+            
+            // Draw particles
+            particles.forEach(p => {
+                const iso = worldToIso(p.x, p.y, p.z);
+                drawParticle(iso.x, iso.y, p);
+            });
+            
+            // Draw HUD
+            drawHUD();
+            
+            // Store frame for next iteration (memory copy optimization)
+            try {
+                previousFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            } catch (e) {
+                previousFrame = null;
+            }
+            
+            return visibleCount;
+        }
+        
+        function drawFloor(x, y, shade) {
+            const points = [
+                { x: x, y: y },
+                { x: x + TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 },
+                { x: x, y: y + TILE_SIZE * ISO_RATIO },
+                { x: x - TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 }
+            ];
+            
+            ctx.fillStyle = PALETTE.floor[shade];
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            // Add grid line
+            ctx.strokeStyle = PALETTE.floor[Math.min(3, shade + 1)];
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+        
+        function drawWater(x, y, shade) {
+            const points = [
+                { x: x, y: y },
+                { x: x + TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 },
+                { x: x, y: y + TILE_SIZE * ISO_RATIO },
+                { x: x - TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 }
+            ];
+            
+            ctx.fillStyle = PALETTE.water[shade];
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            // Wave effect
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            const time = Date.now() / 500;
+            ctx.moveTo(points[0].x + Math.sin(time) * 3, points[0].y + Math.cos(time) * 2);
+            ctx.lineTo(points[2].x + Math.sin(time + 1) * 3, points[2].y + Math.cos(time + 1) * 2);
+            ctx.stroke();
+        }
+        
+        function drawWall(x, y, shade, height) {
+            const topPoints = [
+                { x: x, y: y - height * 16 },
+                { x: x + TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 - height * 16 },
+                { x: x, y: y + TILE_SIZE * ISO_RATIO - height * 16 },
+                { x: x - TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 - height * 16 }
+            ];
+            
+            const bottomPoints = [
+                { x: x, y: y },
+                { x: x + TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 },
+                { x: x, y: y + TILE_SIZE * ISO_RATIO },
+                { x: x - TILE_SIZE * ISO_RATIO, y: y + TILE_SIZE * ISO_RATIO * 0.5 }
+            ];
+            
+            // Top face
+            ctx.fillStyle = PALETTE.wall[shade];
+            ctx.beginPath();
+            ctx.moveTo(topPoints[0].x, topPoints[0].y);
+            for (let i = 1; i < topPoints.length; i++) {
+                ctx.lineTo(topPoints[i].x, topPoints[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            // Side faces (only if not bottom layer)
+            if (height === 0) {
+                // Right face
+                ctx.fillStyle = PALETTE.wall[Math.min(3, shade + 1)];
+                ctx.beginPath();
+                ctx.moveTo(topPoints[0].x, topPoints[0].y);
+                ctx.lineTo(topPoints[1].x, topPoints[1].y);
+                ctx.lineTo(bottomPoints[1].x, bottomPoints[1].y);
+                ctx.lineTo(bottomPoints[0].x, bottomPoints[0].y);
+                ctx.closePath();
+                ctx.fill();
+                
+                // Left face
+                ctx.fillStyle = PALETTE.wall[Math.min(3, shade + 2)];
+                ctx.beginPath();
+                ctx.moveTo(topPoints[2].x, topPoints[2].y);
+                ctx.lineTo(topPoints[3].x, topPoints[3].y);
+                ctx.lineTo(bottomPoints[3].x, bottomPoints[3].y);
+                ctx.lineTo(bottomPoints[2].x, bottomPoints[2].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+            
+            // Outline
+            ctx.strokeStyle = PALETTE.shadow[shade];
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+        
+        function drawEnemy(x, y, enemy) {
+            const size = 12;
+            const shadeIndex = Math.min(3, Math.floor(
+                Math.sqrt(Math.pow(enemy.x - player.x, 2) + Math.pow(enemy.y - player.y, 2)) / 100
+            ));
+            
+            // Enemy sprite (simple shape)
+            ctx.fillStyle = PALETTE.enemy[shadeIndex];
+            
+            // Body
+            ctx.beginPath();
+            ctx.arc(x, y - 10, size, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Eyes
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(x - 4, y - 12, 3, 0, Math.PI * 2);
+            ctx.arc(x + 4, y - 12, 3, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Health bar
+            const healthWidth = 20;
+            const healthHeight = 3;
+            ctx.fillStyle = '#333';
+            ctx.fillRect(x - healthWidth / 2, y - 25, healthWidth, healthHeight);
+            ctx.fillStyle = enemy.health > 1 ? '#0f0' : '#f00';
+            ctx.fillRect(x - healthWidth / 2, y - 25, healthWidth * (enemy.health / 3), healthHeight);
+        }
+        
+        function drawWeapon(x, y) {
+            const weaponLength = 25;
+            const weaponAngle = player.angle;
+            
+            const endX = x + Math.cos(weaponAngle) * weaponLength;
+            const endY = y + Math.sin(weaponAngle) * weaponLength * ISO_RATIO;
+            
+            ctx.strokeStyle = '#888';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(endX, endY);
+            ctx.stroke();
+            
+            // Muzzle flash if recently fired
+            if (Date.now() - player.lastShot < 100) {
+                ctx.fillStyle = '#ffaa00';
+                ctx.beginPath();
+                ctx.arc(endX, endY, 8, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+        
+        function drawBullet(x, y, bullet) {
+            ctx.fillStyle = '#ffff00';
+            ctx.beginPath();
+            ctx.arc(x, y - 5, 3, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Trail
+            ctx.strokeStyle = 'rgba(255, 255, 0, 0.5)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x, y - 5);
+            ctx.lineTo(x - Math.cos(bullet.angle) * 10, y - 5 - Math.sin(bullet.angle) * 10 * ISO_RATIO);
+            ctx.stroke();
+        }
+        
+        function drawParticle(x, y, particle) {
+            ctx.fillStyle = particle.color;
+            ctx.globalAlpha = particle.life;
+            ctx.beginPath();
+            ctx.arc(x, y - particle.z, particle.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+        
+        function drawHUD() {
+            // Health bar
+            ctx.fillStyle = '#333';
+            ctx.fillRect(10, 10, 150, 20);
+            ctx.fillStyle = player.health > 50 ? '#0f0' : player.health > 25 ? '#ff0' : '#f00';
+            ctx.fillRect(10, 10, 150 * (player.health / 100), 20);
+            ctx.strokeStyle = '#fff';
+            ctx.strokeRect(10, 10, 150, 20);
+            
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px Courier New';
+            ctx.fillText(`HEALTH: ${Math.floor(player.health)}`, 20, 24);
+            
+            // Ammo
+            ctx.fillStyle = '#ff0';
+            ctx.fillText(`AMMO: ${player.ammo}`, 10, 50);
+            
+            // Crosshair
+            ctx.strokeStyle = '#0f0';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(canvas.width / 2 - 10, canvas.height / 2);
+            ctx.lineTo(canvas.width / 2 + 10, canvas.height / 2);
+            ctx.moveTo(canvas.width / 2, canvas.height / 2 - 10);
+            ctx.lineTo(canvas.width / 2, canvas.height / 2 + 10);
+            ctx.stroke();
+        }
+        
+        function update(deltaTime) {
+            // Player movement
+            const keys = {};
+            if (input.keys['w'] || input.keys['arrowup']) player.y -= MOVE_SPEED;
+            if (input.keys['s'] || input.keys['arrowdown']) player.y += MOVE_SPEED;
+            if (input.keys['a'] || input.keys['arrowleft']) player.x -= MOVE_SPEED;
+            if (input.keys['d'] || input.keys['arrowright']) player.x += MOVE_SPEED;
+            
+            // Jump
+            if (input.keys[' '] && player.z <= 0) {
+                player.vz = JUMP_FORCE;
+            }
+            
+            // Apply gravity
+            player.vz += GRAVITY;
+            player.z += player.vz;
+            
+            // Ground collision
+            if (player.z > 0) {
+                player.z = 0;
+                player.vz = 0;
+            }
+            
+            // Map boundaries
+            player.x = Math.max(TILE_SIZE, Math.min(MAP_SIZE * TILE_SIZE - TILE_SIZE, player.x));
+            player.y = Math.max(TILE_SIZE, Math.min(MAP_SIZE * TILE_SIZE - TILE_SIZE, player.y));
+            
+            // Block collision
+            const playerBlockX = Math.floor(player.x / TILE_SIZE);
+            const playerBlockY = Math.floor(player.y / TILE_SIZE);
+            
+            if (playerBlockX >= 0 && playerBlockX < MAP_SIZE &&
+                playerBlockY >= 0 && playerBlockY < MAP_SIZE) {
+                if (map[playerBlockX][playerBlockY].height > 0) {
+                    // Push back from wall
+                    const dx = player.x - (playerBlockX * TILE_SIZE + TILE_SIZE / 2);
+                    const dy = player.y - (playerBlockY * TILE_SIZE + TILE_SIZE / 2);
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < TILE_SIZE / 2) {
+                        player.x -= (dx / dist) * 2;
+                        player.y -= (dy / dist) * 2;
+                    }
+                }
+            }
+            
+            // Camera follows player
+            camera.x = player.x - canvas.width / 2;
+            camera.y = player.y - canvas.height / 3;
+            camera.z = player.z;
+            
+            // Update bullets
+            bullets = bullets.filter(bullet => {
+                bullet.x += Math.cos(bullet.angle) * bullet.speed;
+                bullet.y += Math.sin(bullet.angle) * bullet.speed;
+                bullet.life--;
+                
+                // Check collision with enemies
+                for (let i = enemies.length - 1; i >= 0; i--) {
+                    const enemy = enemies[i];
+                    const dist = Math.sqrt(
+                        Math.pow(bullet.x - enemy.x, 2) + 
+                        Math.pow(bullet.y - enemy.y, 2)
+                    );
+                    
+                    if (dist < 15) {
+                        enemy.health--;
+                        bullet.life = 0;
+                        
+                        // Spawn particles
+                        for (let j = 0; j < 5; j++) {
+                            particles.push({
+                                x: bullet.x,
+                                y: bullet.y,
+                                z: 5,
+                                vx: (Math.random() - 0.5) * 4,
+                                vy: (Math.random() - 0.5) * 4,
+                                vz: Math.random() * 3,
+                                life: 1,
+                                decay: 0.1,
+                                size: Math.random() * 3 + 1,
+                                color: '#ff0000'
+                            });
+                        }
+                        
+                        if (enemy.health <= 0) {
+                            enemies.splice(i, 1);
+                            setTimeout(spawnEnemy, 2000);
+                        }
+                        break;
+                    }
+                }
+                
+                // Check collision with walls
+                const blockX = Math.floor(bullet.x / TILE_SIZE);
+                const blockY = Math.floor(bullet.y / TILE_SIZE);
+                if (blockX >= 0 && blockX < MAP_SIZE &&
+                    blockY >= 0 && blockY < MAP_SIZE &&
+                    map[blockX][blockY].height > 0) {
+                    bullet.life = 0;
+                    
+                    // Spawn particles
+                    for (let j = 0; j < 3; j++) {
+                        particles.push({
+                            x: bullet.x,
+                            y: bullet.y,
+                            z: 5,
+                            vx: (Math.random() - 0.5) * 3,
+                            vy: (Math.random() - 0.5) * 3,
+                            vz: Math.random() * 2,
+                            life: 1,
+                            decay: 0.15,
+                            size: Math.random() * 2 + 1,
+                            color: '#888'
+                        });
+                    }
+                }
+                
+                return bullet.life > 0 &&
+                       bullet.x > 0 && bullet.x < MAP_SIZE * TILE_SIZE &&
+                       bullet.y > 0 && bullet.y < MAP_SIZE * TILE_SIZE;
+            });
+            
+            // Update enemies
+            enemies.forEach(enemy => {
+                const dx = player.x - enemy.x;
+                const dy = player.y - enemy.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                
+                // Move towards player if far enough
+                if (dist > 50) {
+                    enemy.x += (dx / dist) * 0.5;
+                    enemy.y += (dy / dist) * 0.5;
+                }
+                
+                // Shoot at player
+                if (dist < 200 && Date.now() - enemy.lastShot > 1000) {
+                    enemy.lastShot = Date.now();
+                    // Enemy could shoot here
+                }
+            });
+            
+            // Update particles
+            particles = particles.filter(p => {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.z += p.vz;
+                p.vz -= 0.2;
+                p.life -= p.decay;
+                return p.life > 0;
+            });
+            
+            // Update depth map
+            updateDepthMap();
+        }
+        
+        // Input handling
+        const input = {
+            keys: {},
+            mouseX: 0,
+            mouseY: 0,
+            mouseDown: false
+        };
+        
+        window.addEventListener('keydown', e => {
+            input.keys[e.key.toLowerCase()] = true;
+        });
+        
+        window.addEventListener('keyup', e => {
+            input.keys[e.key.toLowerCase()] = false;
+        });
+        
+        canvas.addEventListener('mousemove', e => {
+            const rect = canvas.getBoundingClientRect();
+            input.mouseX = e.clientX - rect.left;
+            input.mouseY = e.clientY - rect.top;
+            
+            // Calculate player angle from mouse position
+            const dx = input.mouseX - canvas.width / 2;
+            const dy = (input.mouseY - canvas.height / 2) / ISO_RATIO;
+            player.angle = Math.atan2(dy, dx);
+        });
+        
+        canvas.addEventListener('mousedown', () => {
+            input.mouseDown = true;
+            shoot();
+        });
+        
+        canvas.addEventListener('mouseup', () => {
+            input.mouseDown = false;
+        });
+        
+        function shoot() {
+            if (player.ammo > 0) {
+                player.ammo--;
+                player.lastShot = Date.now();
+                
+                bullets.push({
+                    x: player.x + Math.cos(player.angle) * 20,
+                    y: player.y + Math.sin(player.angle) * 20 * ISO_RATIO,
+                    z: player.z + 10,
+                    angle: player.angle,
+                    speed: 8,
+                    life: 60
+                });
+                
+                // Recoil
+                player.x -= Math.cos(player.angle) * 2;
+                player.y -= Math.sin(player.angle) * 2 * ISO_RATIO;
+            }
+        }
+        
+        // Game loop
+        let totalBlocks = 0;
+        
+        function gameLoop(timestamp) {
+            if (!lastFrame) lastFrame = timestamp;
+            const deltaTime = timestamp - lastFrame;
+            lastFrame = timestamp;
+            
+            // Calculate FPS
+            frameCount++;
+            if (timestamp % 1000 < 20) {
+                fps = frameCount;
+                frameCount = 0;
+            }
+            
+            update(deltaTime);
+            const visibleCount = render();
+            
+            // Count total blocks
+            totalBlocks = 0;
+            for (let x = 0; x < MAP_SIZE; x++) {
+                for (let y = 0; y < MAP_SIZE; y++) {
+                    totalBlocks += map[x][y].height + 1;
+                }
+            }
+            
+            // Update stats
+            statsEl.textContent = `FPS: ${fps} | Total Blocks: ${totalBlocks} | Visible: ${visibleCount}`;
+            
+            requestAnimationFrame(gameLoop);
+        }
+        
+        // Initialize and start
+        initMap();
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
